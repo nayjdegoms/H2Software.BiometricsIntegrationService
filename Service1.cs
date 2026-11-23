@@ -1,12 +1,14 @@
 ﻿
-using System;
-using System.Collections.Concurrent;
-using System.Linq;
-using System.ServiceProcess;
+using SmackBio.WebSocketSDK;
 using SuperSocket.SocketBase;
 using SuperSocket.SocketEngine;
 using SuperWebSocket;
-using SmackBio.WebSocketSDK;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.ServiceProcess;
+using static H2Software.BiometricsIntegrationService.MaintenanceApiHost;
 
 namespace H2Software.BiometricsIntegrationService
 {
@@ -17,6 +19,8 @@ namespace H2Software.BiometricsIntegrationService
         private readonly ConcurrentDictionary<string, SBWebSocketHandler>
             _handlers =
                 new ConcurrentDictionary<string, SBWebSocketHandler>();
+
+        private MaintenanceApiHost _maintenanceApi;
 
         public Service1()
         {
@@ -68,6 +72,20 @@ namespace H2Software.BiometricsIntegrationService
 
                 ServiceLogger.Log(
                     "WebSocket server is listening on port 482.");
+
+                string maintenanceToken =
+                    System.Configuration.ConfigurationManager
+                        .AppSettings["MaintenanceApiToken"];
+
+                _maintenanceApi = new MaintenanceApiHost(
+                    FindActiveDeviceHandler,
+                    GetActiveDevices,
+                    maintenanceToken);
+
+                _maintenanceApi.Start();
+
+                ServiceLogger.Log(
+                    "Maintenance API is listening on 127.0.0.1:5001.");
             }
             catch (Exception ex)
             {
@@ -178,6 +196,37 @@ namespace H2Software.BiometricsIntegrationService
                     "Session close error", ex);
             }
         }
+        
+        internal SBWebSocketHandler FindActiveDeviceHandler(
+            string deviceId)
+        {
+            if (string.IsNullOrWhiteSpace(deviceId))
+            {
+                return _handlers.Values.FirstOrDefault(
+                    h => h != null && h.loggedIn);
+            }
+
+            return _handlers.Values.FirstOrDefault(
+                h => h != null
+                && h.loggedIn
+                && string.Equals(
+                    h.deviceId,
+                    deviceId,
+                    StringComparison.OrdinalIgnoreCase));
+        }
+
+        internal IEnumerable<MaintenanceDeviceInfo>
+            GetActiveDevices()
+        {
+            return _handlers.Values
+                .Where(h => h != null && h.loggedIn)
+                .Select(h => new MaintenanceDeviceInfo
+                {
+                    DeviceUid = h.deviceId,
+                    SessionId = h.SessionId.ToString()
+                })
+                .ToList();
+        }
 
         protected override void OnStop()
         {
@@ -186,6 +235,9 @@ namespace H2Software.BiometricsIntegrationService
 
             try
             {
+                _maintenanceApi?.Stop();
+                _maintenanceApi = null;
+
                 _bootstrap?.Stop();
                 _bootstrap = null;
 

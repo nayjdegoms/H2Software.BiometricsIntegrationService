@@ -2,6 +2,7 @@
 using System.Configuration;
 using System.Globalization;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
@@ -14,6 +15,7 @@ namespace H2Software.BiometricsIntegrationService
 
         private readonly string _apiMode;
         private readonly string _apiUrl;
+        private readonly string _cloudApiToken;
 
         public AttendanceApiForwarder()
         {
@@ -28,10 +30,20 @@ namespace H2Software.BiometricsIntegrationService
             if (_apiMode == "CLOUD")
             {
                 _apiUrl = ConfigurationManager.AppSettings["CloudAttendanceApiUrl"];
+
+                // Retrieve JWT from Windows environment variable.
+                _cloudApiToken = Environment.GetEnvironmentVariable(
+                    "CloudAttendanceApiToken",
+                    EnvironmentVariableTarget.Machine);
+
+                if (string.IsNullOrWhiteSpace(_cloudApiToken))
+                    throw new ConfigurationErrorsException(
+                        "CloudAttendanceApiToken environment variable is missing.");
             }
             else if (_apiMode == "LOCAL")
             {
                 _apiUrl = ConfigurationManager.AppSettings["LocalAttendanceApiUrl"];
+                _cloudApiToken = null;
             }
             else
             {
@@ -41,6 +53,8 @@ namespace H2Software.BiometricsIntegrationService
 
             if (string.IsNullOrWhiteSpace(_apiUrl))
                 throw new ConfigurationErrorsException(
+                    "The API URL for AttendanceApiMode '" + _apiMode
+                    + "' is missing from App.config.");
                     "The API URL for AttendanceApiMode '" + _apiMode + "' is missing from App.config.");
 
             _apiUrl = _apiUrl.Trim();
@@ -57,6 +71,11 @@ namespace H2Software.BiometricsIntegrationService
             switch (deviceStatus)
             {
                 case "DutyOn":
+                    punchType = "IN";
+                    break;
+
+                case "DutyOff":
+                    punchType = "OUT";
                     punchType = "TimeIn";
                     break;
 
@@ -94,6 +113,21 @@ namespace H2Software.BiometricsIntegrationService
             if (_apiMode == "CLOUD")
             {
                 // CLOUD API payload.
+                var record = new[]
+                {
+                    new
+                    {
+                        personnelBioCode = employeeId.ToString(
+                            CultureInfo.InvariantCulture),
+
+                        dateEntry = punchTime.ToString(
+                            "yyyy-MM-dd", CultureInfo.InvariantCulture),
+
+                        timeEntry = punchTime.ToString(
+                            "HH:mm:ss", CultureInfo.InvariantCulture),
+
+                        inOutEvent = punchType
+                    }
                 var record = new
                 {
                     personnelBioCode = employeeId.ToString(CultureInfo.InvariantCulture),
@@ -112,6 +146,12 @@ namespace H2Software.BiometricsIntegrationService
             }
             else
             {
+                // LOCAL API payload (preserved).
+                var record = new
+                {
+                    EmployeeId = employeeId.ToString(
+                        CultureInfo.InvariantCulture),
+
                 // LOCAL API payload (the original working request structure).
                 var record = new
                 {
@@ -121,6 +161,7 @@ namespace H2Software.BiometricsIntegrationService
                 };
 
                 json = JsonConvert.SerializeObject(record);
+
                 requestUrl = _apiUrl.TrimEnd('/') + "/api/attendance";
 
                 ServiceLogger.Log(
@@ -133,6 +174,75 @@ namespace H2Software.BiometricsIntegrationService
             {
                 try
                 {
+                    using (var request = new HttpRequestMessage(
+                        HttpMethod.Post, requestUrl))
+                    {
+                        request.Content = new StringContent(
+                            json,
+                            Encoding.UTF8,
+                            "application/json");
+
+                        // Add JWT Bearer authentication for CLOUD only.
+                        if (_apiMode == "CLOUD")
+                        {
+                            request.Headers.Authorization =
+                                new AuthenticationHeaderValue(
+                                    "Bearer",
+                                    _cloudApiToken);
+                        }
+
+                        using (var response = await _httpClient.SendAsync(request))
+                        {
+                            string responseBody = string.Empty;
+
+                            // HTTP 401: Missing, invalid or expired token.
+                            if ((int)response.StatusCode == 401)
+                            {
+                                ServiceLogger.Log(
+                                    "Cloud API authentication failed (401). "
+                                    + "Check JWT token and expiration.");
+
+                                return false;
+                            }
+
+                            // HTTP 403: Authenticated but not authorized.
+                            if ((int)response.StatusCode == 403)
+                            {
+                                ServiceLogger.Log(
+                                    "Cloud API access forbidden (403). "
+                                    + "Check API authorization permissions.");
+
+                                return false;
+                            }
+
+                            // Preserve existing behavior: success or 409
+                            // is treated as accepted attendance submission.
+                            if (response.IsSuccessStatusCode ||
+                                (int)response.StatusCode == 409)
+                            {
+                                responseBody =
+                                await response.Content.ReadAsStringAsync();
+
+                                ServiceLogger.Log(
+                                    (_apiMode == "CLOUD" ? "Cloud" : "Local")
+                                    + " Attendance API accepted the request. HTTP "
+                                    + (int)response.StatusCode
+                                    + ". Employee: " + employeeId
+                                    + ", Type: " + punchType
+                                    + ". Response: " + responseBody);
+
+                                return true;
+                            }
+
+                            responseBody =
+                                await response.Content.ReadAsStringAsync();
+
+                            ServiceLogger.Log(
+                                (_apiMode == "CLOUD" ? "Cloud" : "Local")
+                                + " API error. HTTP "
+                                + (int)response.StatusCode
+                                + ". Response: " + responseBody);
+                        }
                     using (var content = new StringContent(
                         json, Encoding.UTF8, "application/json"))
                     using (var response = await _httpClient.PostAsync(
@@ -166,6 +276,8 @@ namespace H2Software.BiometricsIntegrationService
                 catch (Exception ex)
                 {
                     ServiceLogger.LogError(
+                        _apiMode + " API forwarding attempt "
+                        + attempt + " failed",
                         _apiMode + " API forwarding attempt " + attempt + " failed",
                         ex);
                 }
