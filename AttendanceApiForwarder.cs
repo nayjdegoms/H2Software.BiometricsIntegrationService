@@ -55,6 +55,7 @@ namespace H2Software.BiometricsIntegrationService
                 throw new ConfigurationErrorsException(
                     "The API URL for AttendanceApiMode '" + _apiMode
                     + "' is missing from App.config.");
+                    "The API URL for AttendanceApiMode '" + _apiMode + "' is missing from App.config.");
 
             _apiUrl = _apiUrl.Trim();
         }
@@ -75,6 +76,11 @@ namespace H2Software.BiometricsIntegrationService
 
                 case "DutyOff":
                     punchType = "OUT";
+                    punchType = "TimeIn";
+                    break;
+
+                case "DutyOff":
+                    punchType = "TimeOut";
                     break;
 
                 case "Out":
@@ -122,6 +128,12 @@ namespace H2Software.BiometricsIntegrationService
 
                         inOutEvent = punchType
                     }
+                var record = new
+                {
+                    personnelBioCode = employeeId.ToString(CultureInfo.InvariantCulture),
+                    dateEntry = punchTime.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                    timeEntry = punchTime.ToString("HH:mm:ss", CultureInfo.InvariantCulture),
+                    inOutEvent = punchType
                 };
 
                 json = JsonConvert.SerializeObject(record);
@@ -140,6 +152,10 @@ namespace H2Software.BiometricsIntegrationService
                     EmployeeId = employeeId.ToString(
                         CultureInfo.InvariantCulture),
 
+                // LOCAL API payload (the original working request structure).
+                var record = new
+                {
+                    EmployeeId = employeeId.ToString(CultureInfo.InvariantCulture),
                     PunchTime = punchTime,
                     PunchType = punchType
                 };
@@ -227,6 +243,34 @@ namespace H2Software.BiometricsIntegrationService
                                 + (int)response.StatusCode
                                 + ". Response: " + responseBody);
                         }
+                    using (var content = new StringContent(
+                        json, Encoding.UTF8, "application/json"))
+                    using (var response = await _httpClient.PostAsync(
+                        requestUrl, content))
+                    {
+                        // Preserves the existing behavior: HTTP success or 409
+                        // is treated as an accepted attendance submission.
+                        if (response.IsSuccessStatusCode ||
+                            (int)response.StatusCode == 409)
+                        {
+                            ServiceLogger.Log(
+                                (_apiMode == "CLOUD" ? "Cloud" : "Local")
+                                + " Attendance API accepted the request. HTTP "
+                                + (int)response.StatusCode
+                                + ". Employee: " + employeeId
+                                + ", Type: " + punchType);
+
+                            return true;
+                        }
+
+                        string responseBody =
+                            await response.Content.ReadAsStringAsync();
+
+                        ServiceLogger.Log(
+                            (_apiMode == "CLOUD" ? "Cloud" : "Local")
+                            + " API error. HTTP "
+                            + (int)response.StatusCode
+                            + ". Response: " + responseBody);
                     }
                 }
                 catch (Exception ex)
@@ -234,6 +278,7 @@ namespace H2Software.BiometricsIntegrationService
                     ServiceLogger.LogError(
                         _apiMode + " API forwarding attempt "
                         + attempt + " failed",
+                        _apiMode + " API forwarding attempt " + attempt + " failed",
                         ex);
                 }
 
